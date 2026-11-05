@@ -4,12 +4,28 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# DEV ONLY: accept `x-user-id` / `x-user-role` headers as identity. The server
+# refuses to start if this is compiled into a release build.
+dev-auth = []
+# DEV ONLY: log the (stubbed) verification emails instead of dropping them.
+dev-email = []
+# Use PostGIS for discovery (needs PostGIS in the database).
+postgis = ["twoeat-persistence/postgis"]
+
 [dependencies]
 twoeat-domain.workspace = true
 twoeat-geo.workspace = true
 twoeat-payments.workspace = true
 twoeat-persistence.workspace = true
 anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+governor.workspace = true
+password-hash.workspace = true
+rand.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
@@ -25,3 +41,4 @@ uuid.workspace = true
 [dev-dependencies]
 http-body-util.workspace = true
 tower.workspace = true
+sqlx.workspace = true

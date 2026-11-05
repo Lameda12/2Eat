@@ -1,6 +1,6 @@
 use utoipa::{
     Modify, OpenApi,
-    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
+    openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
 };
 
 use crate::{dto::*, error::*, routes::*};
@@ -11,18 +11,13 @@ impl Modify for Security {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let c = openapi.components.get_or_insert_with(Default::default);
         c.add_security_scheme(
-            "user_id",
-            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "x-user-id",
-                "MVP stand-in for authentication: caller's UUID. A cook's user id is their cook id.",
-            ))),
-        );
-        c.add_security_scheme(
-            "admin_token",
-            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "x-admin-token",
-                "Operator token for certificate review.",
-            ))),
+            "bearer_auth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some("Opaque bearer token from POST /auth/login (valid 30 days, revocable)."))
+                    .build(),
+            ),
         );
     }
 }
@@ -37,22 +32,29 @@ impl Modify for Security {
         version = "0.1.0"
     ),
     paths(
+        auth::register, auth::login, auth::logout, auth::refresh,
         cooks::onboarding_terms, cooks::register, cooks::nearby, cooks::cook_dishes,
         dishes::create,
         orders::create, orders::get, orders::accept, orders::ready, orders::complete, orders::cancel, orders::refund,
-        admin::get_submission, admin::approve, admin::reject, admin::revoke,
+        admin::list_reviews, admin::approve_review, admin::reject_review,
+        admin::get_submission, admin::approve_cook_certification, admin::reject_cook_certification, admin::revoke,
+        admin::flagged_dishes, admin::approve_dish, admin::reject_dish,
+        admin::list_refunds, admin::approve_refund, admin::deny_refund,
+        admin::audit,
     ),
     components(schemas(
         RegisterCookForm, RegisterCookResponse, OnboardingTerms, NearbyCookResponse,
         CreateDishRequest, DishResponse,
         FulfillmentDto, OrderItemRequest, CreateOrderRequest, RefundRequest, OrderItemResponse, RefundResponse, OrderResponse,
-        ApproveCertificationRequest, CookStatusResponse, SubmissionResponse,
+        RegisterRequest, LoginRequest, TokenResponse, UserSummary, MessageResponse,
+        RefundAccepted, RefundItem, RefundPage,
+        NotesRequest, ApproveCertificationRequest, RejectCertificationRequest, CookStatusResponse, ReviewItem, ReviewPage, DishPage, AuditItem,
         ErrorBody, ErrorDetail,
     )),
     modifiers(&Security),
     tags(
-        (name = "cooks"), (name = "dishes"), (name = "orders"),
-        (name = "admin", description = "Operator endpoints for certificate review")
+        (name = "auth"), (name = "cooks"), (name = "dishes"), (name = "orders"),
+        (name = "admin", description = "Admin-role endpoints: certificate review, flagged dishes, refund review, audit log")
     )
 )]
 pub struct ApiDoc;

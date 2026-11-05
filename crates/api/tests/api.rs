@@ -1,3 +1,7 @@
+#![cfg(feature = "dev-auth")]
+// Phase 1 end-to-end suite. It authenticates with the dev-only `x-user-id` header, so it only
+// builds with `--features dev-auth`; auth_flows.rs covers the real bearer-token path.
+
 use std::sync::Arc;
 
 use axum::{
@@ -18,7 +22,7 @@ use twoeat_payments::{MockPaymentGateway, PaymentGateway};
 use twoeat_persistence::{MemoryStore, Store};
 use uuid::Uuid;
 
-const ADMIN: &str = "test-admin-token";
+const ADMIN_ID: &str = "00000000-0000-4000-8000-0000000000ad";
 const PDF: &[u8] = b"%PDF-1.4 fake certificate";
 
 struct App {
@@ -32,13 +36,13 @@ fn app() -> App {
     let store = Arc::new(MemoryStore::new());
     let pay = Arc::new(MockPaymentGateway::new());
     let clock = Arc::new(ManualClock::new(Utc::now()));
-    let state = AppState {
-        store: store.clone(),
-        payments: pay.clone(),
-        documents: Arc::new(MemoryDocuments::default()),
-        clock: clock.clone(),
-        config: AppConfig { admin_token: ADMIN.into(), pricing: PricingPolicy::default() },
-    };
+    let state = AppState::new(
+        store.clone(),
+        pay.clone(),
+        Arc::new(MemoryDocuments::default()),
+        clock.clone(),
+        AppConfig::new(PricingPolicy::default()),
+    );
     App { router: twoeat_api::router(state), store, pay, clock }
 }
 
@@ -56,7 +60,8 @@ async fn send(app: &App, c: Call<'_>) -> (StatusCode, Value) {
         req = req.header("x-user-id", u.to_string());
     }
     if c.admin {
-        req = req.header("x-admin-token", ADMIN);
+        // The x-admin-token mechanism is gone: admins are ordinary users with the admin role.
+        req = req.header("x-user-id", ADMIN_ID).header("x-user-role", "admin");
     }
     let body = match c.body {
         Some(v) => {
@@ -229,11 +234,12 @@ async fn prohibited_dishes_are_rejected() {
     let (s, v) = post(&app, "/dishes", Some(cook), json!({"name": "Oysters", "price_cents": 2000, "is_raw_seafood": true})).await;
     assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("raw_seafood_prohibited")));
 
+    // Phase 2: a keyword match alone no longer rejects; it is created inactive and flagged for admin review.
     let (s, v) = post(&app, "/dishes", Some(cook), json!({"name": "Salmon sashimi", "price_cents": 1800})).await;
-    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("raw_seafood_prohibited")));
+    assert_eq!((s, v["review_status"].as_str(), v["is_active"].as_bool()), (StatusCode::CREATED, Some("pending_review"), Some(false)));
 
     let (_, dishes) = get(&app, &format!("/cooks/{cook}/dishes"), None).await;
-    assert_eq!(dishes.as_array().unwrap().len(), 1, "nothing prohibited was stored");
+    assert_eq!(dishes.as_array().unwrap().len(), 1, "nothing prohibited is listed");
 }
 
 #[tokio::test]
@@ -331,12 +337,17 @@ async fn full_refund_includes_platform_and_delivery_fee_and_is_not_repeatable() 
     let uri = format!("/orders/{order}/refund");
     let (s, v) = post(&app, &uri, Some(eater), json!({"reason": "unfulfilled"})).await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(v["status"], "refunded");
-    assert_eq!(v["refund"]["amount_cents"].as_i64(), Some(total), "refund equals the full total");
+    // Phase 2: the refund endpoint answers { status, refund_id }; the order carries the amounts.
+    assert_eq!(v["status"], "approved");
+    let refund_id = v["refund_id"].as_str().unwrap().to_owned();
+    let (_, o) = get(&app, &format!("/orders/{order}"), Some(eater)).await;
+    assert_eq!(o["status"], "refunded");
+    assert_eq!(o["refund"]["amount_cents"].as_i64(), Some(total), "refund equals the full total");
     assert_eq!(app.pay.state_of(&pay), Some(twoeat_payments::PaymentState::Refunded));
 
+    // Phase 2: one refund per order, ever. Asking again is idempotent: same refund, no second payout.
     let (s, v) = post(&app, &uri, Some(eater), json!({"reason": "unfulfilled"})).await;
-    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("invalid_transition")));
+    assert_eq!((s, v["refund_id"].as_str()), (StatusCode::OK, Some(refund_id.as_str())));
 }
 
 #[tokio::test]
@@ -346,7 +357,8 @@ async fn refund_of_unaccepted_order_releases_the_hold() {
     let (order, eater, _) = place_order(&app, cook, dish, 1, json!({"type": "pickup"})).await;
     let pay = app.store.get_order(order).await.unwrap().payment_ref.unwrap();
     let (s, v) = post(&app, &format!("/orders/{order}/refund"), Some(eater), json!({"reason": "other"})).await;
-    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("cancelled")));
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("approved")));
+    assert_eq!(app.store.get_order(order).await.unwrap().status, twoeat_domain::OrderStatus::Cancelled);
     assert_eq!(app.pay.state_of(&pay), Some(twoeat_payments::PaymentState::Voided));
 }
 
@@ -362,7 +374,8 @@ async fn completed_orders_refund_only_for_incorrect_or_missing() {
     let (s, _) = post(&app, &uri, Some(eater), json!({"reason": "other"})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (s, v) = post(&app, &uri, Some(eater), json!({"reason": "incorrect_order"})).await;
-    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("refunded")));
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("approved")));
+    assert_eq!(app.store.get_order(order).await.unwrap().status, twoeat_domain::OrderStatus::Refunded);
 }
 
 #[tokio::test]
@@ -406,8 +419,11 @@ async fn authorization_rules() {
     let (s, _) = post(&app, &format!("/orders/{order}/refund"), Some(Uuid::new_v4()), json!({"reason": "other"})).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
+    // Phase 2: no x-admin-token any more; anonymous callers get 401 and non-admins 403.
     let (s, _) = post(&app, &format!("/admin/cooks/{cook}/revoke"), None, json!({})).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "admin endpoints need the token");
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "admin endpoints need an authenticated admin");
+    let (s, _) = post(&app, &format!("/admin/cooks/{cook}/revoke"), Some(eater), json!({})).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "non-admins are refused");
 
     // Eaters can cancel only before acceptance; afterwards it's a refund.
     post_empty(&app, &uri, cook).await;
@@ -451,7 +467,7 @@ async fn openapi_spec_documents_the_api() {
         assert!(v["paths"].get(p).is_some(), "missing {p}");
     }
     assert_eq!(v["info"]["title"], "2Eat API");
-    assert!(v["components"]["securitySchemes"]["user_id"].is_object());
+    assert!(v["components"]["securitySchemes"]["bearer_auth"].is_object());
 }
 
 // Compile-time check that the gateway trait object can be shared.

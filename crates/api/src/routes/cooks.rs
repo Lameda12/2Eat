@@ -1,10 +1,10 @@
 use axum::{
     Json,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{Extensions, StatusCode},
 };
-use twoeat_domain::{CertificationSubmission, Cook, FOOD_SAFETY_COURSE, HBFB_TERMS, HbfbAcknowledgements, LatLng};
-use twoeat_geo::{NearbyQuery, coarse_distance_m};
+use twoeat_domain::{CertificationSubmission, Cook, CurrentUser, FOOD_SAFETY_COURSE, HBFB_TERMS, HbfbAcknowledgements, LatLng, Role};
+use twoeat_geo::coarse_distance_m;
 use uuid::Uuid;
 
 use crate::{
@@ -40,18 +40,38 @@ fn sniff(content_type: &str, bytes: &[u8]) -> bool {
     }
 }
 
-/// Register a cook. The certificate upload is required; the cook cannot list
-/// dishes or accept orders until an admin verifies it.
+/// Create the cook profile for the authenticated account (which must have been
+/// registered with role `cook`; the cook id is the user id). The certificate
+/// upload is required; the cook cannot list dishes or accept orders until an
+/// admin approves it.
 #[utoipa::path(
     post, path = "/cooks/register", tag = "cooks",
+    security(("bearer_auth" = [])),
     request_body(content = RegisterCookForm, content_type = "multipart/form-data"),
     responses(
         (status = 201, body = RegisterCookResponse),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Account is not a cook account"),
+        (status = 409, body = ErrorBody, description = "Cook profile already exists"),
         (status = 400, body = ErrorBody, description = "Missing/invalid field or document"),
         (status = 422, body = ErrorBody, description = "HBFB conditions not accepted"),
     )
 )]
-pub async fn register(State(st): State<AppState>, mut mp: Multipart) -> Result<(StatusCode, Json<RegisterCookResponse>), ApiError> {
+pub async fn register(
+    State(st): State<AppState>,
+    ext: Extensions,
+    mut mp: Multipart,
+) -> Result<(StatusCode, Json<RegisterCookResponse>), ApiError> {
+    let cook_id = match ext.get::<CurrentUser>() {
+        Some(u) if u.role == Role::Cook => u.id,
+        Some(_) => return Err(ApiError::Forbidden("only accounts registered with role 'cook' can create a cook profile")),
+        // `dev-auth` only: Phase 1 allowed anonymous registration with a server-made id.
+        #[cfg(feature = "dev-auth")]
+        None => Uuid::new_v4(),
+        #[cfg(not(feature = "dev-auth"))]
+        None => return Err(ApiError::Unauthorized("authentication required")),
+    };
+
     let (mut name, mut lat, mut lng, mut accepted) = (None::<String>, None::<f64>, None::<f64>, false);
     let mut doc: Option<(String, Vec<u8>)> = None;
 
@@ -84,7 +104,7 @@ pub async fn register(State(st): State<AppState>, mut mp: Multipart) -> Result<(
 
     let now = st.clock.now();
     let acks = if accepted { HbfbAcknowledgements::all() } else { HbfbAcknowledgements::default() };
-    let cook = Cook::register(Uuid::new_v4(), &name, location, &acks)?;
+    let cook = Cook::register(cook_id, &name, location, &acks)?;
 
     let document_ref = st.documents.put(&content_type, bytes).await?;
     let submission = CertificationSubmission::new(cook.id, document_ref, content_type, now)?;
@@ -108,8 +128,11 @@ pub async fn register(State(st): State<AppState>, mut mp: Multipart) -> Result<(
     responses((status = 200, body = Vec<NearbyCookResponse>), (status = 400, body = ErrorBody))
 )]
 pub async fn nearby(State(st): State<AppState>, Query(p): Query<NearbyParams>) -> Result<Json<Vec<NearbyCookResponse>>, ApiError> {
-    let q = NearbyQuery::new(LatLng::new(p.lat, p.lng)?, p.radius_m, p.limit)?;
-    let hits = st.store.nearby_cooks(&q, st.clock.now()).await?;
+    let center = LatLng::new(p.lat, p.lng)?;
+    let radius_m = p.radius_m.unwrap_or(twoeat_geo::DEFAULT_RADIUS_M);
+    // Validate once here (fixed error messages), the repo validates again defensively.
+    twoeat_geo::NearbyQuery::new(center, Some(radius_m), p.limit)?;
+    let hits = st.locations.find_nearby(center, radius_m / 1000.0, p.limit.unwrap_or(20), st.clock.now()).await?;
     Ok(Json(
         hits.into_iter()
             .map(|h| NearbyCookResponse { id: h.id, display_name: h.display_name, distance_m: coarse_distance_m(h.distance_m) })

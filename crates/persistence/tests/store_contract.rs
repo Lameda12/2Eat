@@ -101,9 +101,18 @@ async fn contract(store: Arc<dyn Store>) {
     // --- order round trip, pickup and delivery ---
     let pickup = place(s, &cook, &dish, 2, Fulfillment::Pickup).await;
     assert_eq!(s.get_order(pickup.id).await.unwrap(), pickup);
-    let delivery =
-        place(s, &cook, &dish, 1, Fulfillment::Delivery(DeliveryDetails { address: "1 Test Rd".into(), postal_code: "123456".into() }))
-            .await;
+    let delivery = place(
+        s,
+        &cook,
+        &dish,
+        1,
+        Fulfillment::Delivery(DeliveryDetails {
+            address: "1 Test Rd".into(),
+            postal_code: "123456".into(),
+            delivered_by: DeliveredBy::Cook,
+        }),
+    )
+    .await;
     assert_eq!(s.get_order(delivery.id).await.unwrap(), delivery);
 
     // --- transitions persist; domain errors roll back ---
@@ -146,7 +155,7 @@ async fn pg_in_fresh_schema() -> Option<PgStore> {
         .after_connect(move |conn, _| {
             let s = s2.clone();
             Box::pin(async move {
-                sqlx::query(&format!("SET search_path TO {s}")).execute(conn).await?;
+                sqlx::query(&format!("SET search_path TO {s}, public")).execute(conn).await?;
                 Ok(())
             })
         })

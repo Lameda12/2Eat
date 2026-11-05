@@ -6,17 +6,31 @@ use crate::cook::Cook;
 use crate::dish::Dish;
 use crate::error::{DomainError, RegulatoryViolation};
 
+/// Who physically delivers an order. 2Eat does **not** dispatch third-party
+/// couriers in Singapore, so the only variant is the cook.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveredBy {
+    #[default]
+    Cook,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryDetails {
     pub address: String,
     /// Singapore 6-digit postal code.
     pub postal_code: String,
+    /// Always the cook; explicit in the type so a courier model cannot appear by accident.
+    #[serde(default)]
+    pub delivered_by: DeliveredBy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Fulfillment {
     Pickup,
+    /// Delivery performed **by the cook** (`delivered_by: DeliveredBy::Cook`).
+    /// 2Eat has no courier model: no third-party dispatch, routing or tracking.
     Delivery(DeliveryDetails),
 }
 
@@ -395,7 +409,11 @@ mod tests {
     }
 
     fn delivery() -> Fulfillment {
-        Fulfillment::Delivery(DeliveryDetails { address: "1 Example Rd #01-01".into(), postal_code: "123456".into() })
+        Fulfillment::Delivery(DeliveryDetails {
+            address: "1 Example Rd #01-01".into(),
+            postal_code: "123456".into(),
+            delivered_by: DeliveredBy::Cook,
+        })
     }
 
     #[test]
@@ -574,11 +592,48 @@ mod tests {
     #[test]
     fn validates_delivery_details_and_items() {
         let f = fx();
-        let bad_postal = Fulfillment::Delivery(DeliveryDetails { address: "x".into(), postal_code: "12ab56".into() });
+        let bad_postal =
+            Fulfillment::Delivery(DeliveryDetails { address: "x".into(), postal_code: "12ab56".into(), delivered_by: DeliveredBy::Cook });
         assert!(Order::place(&f.cook, &f.dishes, new_order(&f, 1, bad_postal), &PricingPolicy::default(), f.now).is_err());
         assert!(Order::place(&f.cook, &f.dishes, new_order(&f, 0, Fulfillment::Pickup), &PricingPolicy::default(), f.now).is_err());
         let empty = NewOrder { items: vec![], ..new_order(&f, 1, Fulfillment::Pickup) };
         assert!(Order::place(&f.cook, &f.dishes, empty, &PricingPolicy::default(), f.now).is_err());
+    }
+
+    #[test]
+    fn delivery_is_cook_performed_by_default() {
+        let d: Fulfillment = serde_json::from_str(r#"{"type":"delivery","address":"a","postal_code":"123456"}"#).unwrap();
+        match d {
+            Fulfillment::Delivery(d) => assert_eq!(d.delivered_by, DeliveredBy::Cook),
+            _ => panic!("expected delivery"),
+        }
+        // There is no way to ask for a courier.
+        assert!(
+            serde_json::from_str::<Fulfillment>(r#"{"type":"delivery","address":"a","postal_code":"123456","delivered_by":"grab"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expiry_between_placement_and_acceptance_blocks_acceptance() {
+        let f = fx();
+        // Eligible at placement time...
+        let mut o = place(&f, 1, Fulfillment::Pickup);
+        assert!(f.cook.can_sell(o.placed_at));
+        // ...certificate lapses before the cook gets to it.
+        let expiry = f.cook.food_safety_cert_expires_at.unwrap();
+        assert_eq!(
+            o.accept(&f.cook, expiry),
+            Err(DomainError::RegulatoryViolation(RegulatoryViolation::CertificationExpired)),
+            "exact expiry instant already blocks"
+        );
+        assert_eq!(
+            o.accept(&f.cook, expiry + Duration::hours(1)),
+            Err(DomainError::RegulatoryViolation(RegulatoryViolation::CertificationExpired))
+        );
+        assert_eq!(o.status, OrderStatus::Placed, "a refused acceptance changes nothing");
+        // One tick earlier it would still have worked.
+        assert!(o.accept(&f.cook, expiry - Duration::nanoseconds(1)).is_ok());
     }
 
     #[test]

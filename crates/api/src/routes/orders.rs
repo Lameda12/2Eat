@@ -1,15 +1,18 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
 };
 use chrono::{DateTime, Utc};
-use twoeat_domain::{DomainError, NewOrder, Order, OrderStatus, RequestedLine};
+use twoeat_domain::{
+    CurrentUser, DomainError, NewOrder, Order, OrderStatus, RefundInitiator, RefundRecord, RefundSettlement, RefundStatus, RequestedLine,
+    Role,
+};
 use twoeat_payments::AuthorizeRequest;
+use twoeat_persistence::NewRefund;
 use uuid::Uuid;
 
 use crate::{
-    auth::{Actor, actor_id, is_admin},
     dto::*,
     error::{ApiError, ErrorBody},
     state::AppState,
@@ -30,7 +33,7 @@ async fn owned_by_cook(st: &AppState, id: Uuid, actor: Uuid) -> Result<Order, Ap
 /// authorized for the full amount; nothing is captured until the cook accepts.
 #[utoipa::path(
     post, path = "/orders", tag = "orders",
-    security(("user_id" = [])), request_body = CreateOrderRequest,
+    security(("bearer_auth" = [])), request_body = CreateOrderRequest,
     responses(
         (status = 201, body = OrderResponse),
         (status = 400, body = ErrorBody),
@@ -41,9 +44,10 @@ async fn owned_by_cook(st: &AppState, id: Uuid, actor: Uuid) -> Result<Order, Ap
 )]
 pub async fn create(
     State(st): State<AppState>,
-    Actor(eater_id): Actor,
+    Extension(user): Extension<CurrentUser>,
     Json(req): Json<CreateOrderRequest>,
 ) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
+    let eater_id = user.id;
     let now = st.clock.now();
     let cook = st.store.get_cook(req.cook_id).await?;
     let catalogue = st.store.list_dishes(cook.id).await?;
@@ -83,13 +87,12 @@ pub async fn create(
 
 /// Fetch an order (its eater, its cook, or an admin).
 #[utoipa::path(
-    get, path = "/orders/{id}", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    get, path = "/orders/{id}", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     responses((status = 200, body = OrderResponse), (status = 403, body = ErrorBody), (status = 404, body = ErrorBody))
 )]
-pub async fn get(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>) -> OrderReply {
+pub async fn get(State(st): State<AppState>, Extension(user): Extension<CurrentUser>, Path(id): Path<Uuid>) -> OrderReply {
     let o = st.store.get_order(id).await?;
-    let actor = actor_id(&headers).ok();
-    if !(is_admin(&headers, &st) || actor == Some(o.eater_id) || actor == Some(o.cook_id)) {
+    if !(user.role == Role::Admin || user.id == o.eater_id || user.id == o.cook_id) {
         return Err(ApiError::Forbidden("not your order"));
     }
     Ok(Json(o.into()))
@@ -99,7 +102,7 @@ pub async fn get(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<
 /// and then captures the payment. Fails with 422 if the certificate is not
 /// verified and current.
 #[utoipa::path(
-    post, path = "/orders/{id}/accept", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    post, path = "/orders/{id}/accept", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     responses(
         (status = 200, body = OrderResponse),
         (status = 403, body = ErrorBody), (status = 404, body = ErrorBody),
@@ -107,8 +110,8 @@ pub async fn get(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<
         (status = 422, body = ErrorBody, description = "Cook's certification is not verified or has expired"),
     )
 )]
-pub async fn accept(State(st): State<AppState>, Actor(actor): Actor, Path(id): Path<Uuid>) -> OrderReply {
-    owned_by_cook(&st, id, actor).await?;
+pub async fn accept(State(st): State<AppState>, Extension(user): Extension<CurrentUser>, Path(id): Path<Uuid>) -> OrderReply {
+    owned_by_cook(&st, id, user.id).await?;
     let now = st.clock.now();
     let accepted = st.store.transition_order(id, Box::new(move |cook, o| o.accept(cook, now))).await?;
     let pay = payment_ref(&accepted)?.to_owned();
@@ -129,22 +132,22 @@ pub async fn accept(State(st): State<AppState>, Actor(actor): Actor, Path(id): P
 
 /// Food is ready: `ready_for_pickup` (pickup) or `out_for_delivery` (delivery).
 #[utoipa::path(
-    post, path = "/orders/{id}/ready", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    post, path = "/orders/{id}/ready", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     responses((status = 200, body = OrderResponse), (status = 403, body = ErrorBody), (status = 409, body = ErrorBody))
 )]
-pub async fn ready(State(st): State<AppState>, Actor(actor): Actor, Path(id): Path<Uuid>) -> OrderReply {
-    owned_by_cook(&st, id, actor).await?;
+pub async fn ready(State(st): State<AppState>, Extension(user): Extension<CurrentUser>, Path(id): Path<Uuid>) -> OrderReply {
+    owned_by_cook(&st, id, user.id).await?;
     let now = st.clock.now();
     Ok(Json(st.store.transition_order(id, Box::new(move |_, o| o.mark_ready(now))).await?.into()))
 }
 
 /// Order handed over / delivered.
 #[utoipa::path(
-    post, path = "/orders/{id}/complete", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    post, path = "/orders/{id}/complete", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     responses((status = 200, body = OrderResponse), (status = 403, body = ErrorBody), (status = 409, body = ErrorBody))
 )]
-pub async fn complete(State(st): State<AppState>, Actor(actor): Actor, Path(id): Path<Uuid>) -> OrderReply {
-    owned_by_cook(&st, id, actor).await?;
+pub async fn complete(State(st): State<AppState>, Extension(user): Extension<CurrentUser>, Path(id): Path<Uuid>) -> OrderReply {
+    owned_by_cook(&st, id, user.id).await?;
     let now = st.clock.now();
     Ok(Json(st.store.transition_order(id, Box::new(move |_, o| o.complete(now))).await?.into()))
 }
@@ -163,64 +166,113 @@ async fn cancel_unaccepted(st: &AppState, id: Uuid, now: DateTime<Utc>) -> Resul
             }),
         )
         .await?;
-    // Release the hold in full. The state change is already committed; if the
-    // void fails the authorization simply expires, so log rather than fail.
+    void_hold(st, &order).await;
+    Ok(order)
+}
+
+/// Release the authorization in full. The state change is already committed; if the
+/// void fails the authorization simply expires, so log rather than fail.
+async fn void_hold(st: &AppState, order: &Order) {
     if let Some(p) = &order.payment_ref
         && let Err(e) = st.payments.void(p).await
     {
-        tracing::error!(error = %e, order = %id, "failed to void authorization on cancel");
+        tracing::error!(error = %e, order = %order.id, "failed to void authorization");
     }
-    Ok(order)
+}
+
+/// Pay out an approved refund: return the order's FULL total (items + delivery fee +
+/// platform fee) to the customer, then mark the order refunded. Safe to retry: the
+/// payment provider call is idempotent per order and settlement is idempotent.
+pub(crate) async fn pay_out_refund(st: &AppState, rec: &RefundRecord) -> Result<(), ApiError> {
+    let order = st.store.get_order(rec.order_id).await?;
+    if order.status == OrderStatus::Refunded {
+        return Ok(());
+    }
+    if rec.amount_cents != order.total_cents {
+        return Err(ApiError::Internal(format!("refund {} amount does not match order total", rec.id)));
+    }
+    // Re-validate at payout time: an admin may approve long after the request.
+    order.check_refundable(rec.reason)?;
+    let pay = payment_ref(&order)?;
+    st.payments.refund(pay, order.total_cents, &format!("refund-{}", order.id)).await?;
+    st.store.settle_refund(rec.id, st.clock.now()).await?;
+    Ok(())
 }
 
 /// Cancel an order that the cook has not accepted yet. The authorization is
 /// released in full (nothing was charged).
 #[utoipa::path(
-    post, path = "/orders/{id}/cancel", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    post, path = "/orders/{id}/cancel", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     responses((status = 200, body = OrderResponse), (status = 403, body = ErrorBody), (status = 409, body = ErrorBody))
 )]
-pub async fn cancel(State(st): State<AppState>, Actor(actor): Actor, Path(id): Path<Uuid>) -> OrderReply {
+pub async fn cancel(State(st): State<AppState>, Extension(user): Extension<CurrentUser>, Path(id): Path<Uuid>) -> OrderReply {
     let o = st.store.get_order(id).await?;
-    if actor != o.eater_id && actor != o.cook_id {
+    if user.id != o.eater_id && user.id != o.cook_id {
         return Err(ApiError::Forbidden("not your order"));
     }
     Ok(Json(cancel_unaccepted(&st, id, st.clock.now()).await?.into()))
 }
 
-/// Full refund, platform fee (and delivery fee) included, for an unfulfilled
-/// or incorrect order. Callable by the eater, the cook or an admin. For an
-/// order the cook has not accepted yet this cancels it and releases the hold,
-/// which also returns everything.
+/// Request a full refund for an unfulfilled or incorrect order. Callable by the
+/// order's eater, its cook, or an admin.
 ///
-/// Idempotent towards the payment provider: a retry after a partial failure
-/// does not refund twice.
+/// * `approved`: the entire total, platform and delivery fee included, is returned.
+///   (For an order the cook has not accepted yet this cancels it and releases the hold.)
+/// * `pending_review` (202): an eater who already has 3 refunds in the trailing 30 days
+///   is routed to an admin; **no money moves until an admin decides**.
+///
+/// One refund request per order, ever; repeating the call returns the same refund
+/// (and retries a payout that previously failed).
 #[utoipa::path(
-    post, path = "/orders/{id}/refund", tag = "orders", security(("user_id" = [])), params(("id" = Uuid, Path)),
+    post, path = "/orders/{id}/refund", tag = "orders", security(("bearer_auth" = [])), params(("id" = Uuid, Path)),
     request_body = RefundRequest,
     responses(
-        (status = 200, body = OrderResponse),
+        (status = 200, body = RefundAccepted, description = "Approved"),
+        (status = 202, body = RefundAccepted, description = "Pending admin review"),
         (status = 400, body = ErrorBody), (status = 403, body = ErrorBody), (status = 404, body = ErrorBody),
-        (status = 409, body = ErrorBody, description = "Already refunded / cancelled"),
+        (status = 409, body = ErrorBody, description = "Not refundable in this state, or an admin denied it"),
     )
 )]
-pub async fn refund(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Json(req): Json<RefundRequest>) -> OrderReply {
+pub async fn refund(
+    State(st): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RefundRequest>,
+) -> Result<(StatusCode, Json<RefundAccepted>), ApiError> {
     let order = st.store.get_order(id).await?;
-    let actor = actor_id(&headers).ok();
-    if !(is_admin(&headers, &st) || actor == Some(order.eater_id) || actor == Some(order.cook_id)) {
+    let initiator = if user.role == Role::Admin {
+        RefundInitiator::Admin
+    } else if user.id == order.cook_id {
+        RefundInitiator::Cook
+    } else if user.id == order.eater_id {
+        RefundInitiator::Eater
+    } else {
         return Err(ApiError::Forbidden("not your order"));
+    };
+
+    let outcome = st
+        .store
+        .request_refund(
+            NewRefund { order_id: id, initiated_by: user.id, initiator, reason: req.reason, now: st.clock.now() },
+            st.refund_policy.as_ref(),
+        )
+        .await?;
+    let rec = outcome.record;
+    let accepted = |status: &str| RefundAccepted { status: status.to_owned(), refund_id: rec.id };
+
+    if outcome.order_cancelled {
+        // Never accepted, never charged: the order was cancelled in the same transaction.
+        void_hold(&st, &st.store.get_order(id).await?).await;
+        return Ok((StatusCode::OK, Json(accepted("approved"))));
     }
-    let now = st.clock.now();
-
-    if order.status == OrderStatus::Placed {
-        return Ok(Json(cancel_unaccepted(&st, id, now).await?.into()));
+    match rec.status() {
+        RefundStatus::PendingReview => Ok((StatusCode::ACCEPTED, Json(accepted("pending_review")))),
+        RefundStatus::Denied => Err(ApiError::Store(twoeat_persistence::StoreError::Conflict("an admin denied this refund"))),
+        RefundStatus::Approved => {
+            if rec.settlement == RefundSettlement::Refund {
+                pay_out_refund(&st, &rec).await?;
+            }
+            Ok((StatusCode::OK, Json(accepted("approved"))))
+        }
     }
-
-    // Validate first so we never move money for an order the domain would refuse to refund.
-    order.check_refundable(req.reason)?;
-    let pay = payment_ref(&order)?;
-    st.payments.refund(pay, order.total_cents, &format!("refund-{id}")).await?;
-
-    let reason = req.reason;
-    let updated = st.store.transition_order(id, Box::new(move |_, o| o.refund(reason, now).map(|_| ()))).await?;
-    Ok(Json(updated.into()))
 }

@@ -17,6 +17,8 @@ pub enum ApiError {
     BadRequest(String),
     Unauthorized(&'static str),
     Forbidden(&'static str),
+    InvalidCredentials,
+    RateLimited { retry_after_secs: u64 },
     Internal(String),
 }
 
@@ -60,6 +62,22 @@ impl IntoResponse for ApiError {
                 D::Validation(m) => (StatusCode::BAD_REQUEST, "validation_error".into(), "validation", m),
                 m @ D::InvalidTransition { .. } => (StatusCode::CONFLICT, "invalid_transition".into(), "conflict", m.to_string()),
             },
+            ApiError::Store(StoreError::Conflict(m)) => (StatusCode::CONFLICT, "conflict".into(), "conflict", m.into()),
+            ApiError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "invalid_credentials".into(), "auth", "invalid email or password".into())
+            }
+            ApiError::RateLimited { retry_after_secs } => {
+                let body = ErrorBody {
+                    error: ErrorDetail {
+                        code: "rate_limited".into(),
+                        kind: "rate_limit".into(),
+                        message: "too many attempts, slow down".into(),
+                    },
+                };
+                let mut res = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                res.headers_mut().insert(axum::http::header::RETRY_AFTER, retry_after_secs.max(1).into());
+                return res;
+            }
             ApiError::Store(StoreError::NotFound(what)) => {
                 (StatusCode::NOT_FOUND, "not_found".into(), "not_found", format!("{what} not found"))
             }

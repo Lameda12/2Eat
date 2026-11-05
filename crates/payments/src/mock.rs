@@ -23,6 +23,7 @@ pub enum PaymentState {
 struct Payment {
     amount_cents: i64,
     state: PaymentState,
+    refunded_cents: Option<i64>,
 }
 
 /// In-memory gateway for dev and tests. Enforces the same state rules a real
@@ -51,6 +52,11 @@ impl MockPaymentGateway {
         self.fail_captures.store(v, Ordering::SeqCst);
     }
 
+    /// Test hook: how much the provider was asked to return for this payment.
+    pub fn refunded_cents(&self, payment_id: &str) -> Option<i64> {
+        self.payments.lock().unwrap().get(payment_id).and_then(|p| p.refunded_cents)
+    }
+
     pub fn state_of(&self, payment_id: &str) -> Option<PaymentState> {
         self.payments.lock().unwrap().get(payment_id).map(|p| p.state)
     }
@@ -66,7 +72,10 @@ impl PaymentGateway for MockPaymentGateway {
             return Err(PaymentError::InvalidState("bad amounts".into()));
         }
         let id = format!("mock_pi_{}", Uuid::new_v4().simple());
-        self.payments.lock().unwrap().insert(id.clone(), Payment { amount_cents: req.amount_cents, state: PaymentState::Authorized });
+        self.payments
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Payment { amount_cents: req.amount_cents, state: PaymentState::Authorized, refunded_cents: None });
         Ok(Authorization { id, amount_cents: req.amount_cents })
     }
 
@@ -115,6 +124,7 @@ impl PaymentGateway for MockPaymentGateway {
             )));
         }
         p.state = PaymentState::Refunded;
+        p.refunded_cents = Some(amount_cents);
         let receipt = RefundReceipt { id: format!("mock_re_{}", Uuid::new_v4().simple()), amount_cents };
         self.refunds.lock().unwrap().insert(idempotency_key.to_owned(), receipt.clone());
         Ok(receipt)

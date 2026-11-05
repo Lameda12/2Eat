@@ -140,7 +140,56 @@ impl CertificationStatus {
     }
 }
 
-/// An uploaded certificate document awaiting (or past) human review.
+/// Why an admin rejected a certificate. `Other` keeps free text so the audit
+/// log stays queryable by the structured variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionReason {
+    IllegibleDocument,
+    ExpiredCertificate,
+    WrongCertificateType,
+    NameMismatch,
+    SuspectedFraud,
+    Other(String),
+}
+
+impl RejectionReason {
+    /// `(kind, detail)` as stored in the database; detail is only set for `Other`.
+    pub fn to_parts(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::IllegibleDocument => ("illegible_document", None),
+            Self::ExpiredCertificate => ("expired_certificate", None),
+            Self::WrongCertificateType => ("wrong_certificate_type", None),
+            Self::NameMismatch => ("name_mismatch", None),
+            Self::SuspectedFraud => ("suspected_fraud", None),
+            Self::Other(t) => ("other", Some(t.as_str())),
+        }
+    }
+
+    pub fn from_parts(kind: &str, detail: Option<String>) -> Option<Self> {
+        Some(match kind {
+            "illegible_document" => Self::IllegibleDocument,
+            "expired_certificate" => Self::ExpiredCertificate,
+            "wrong_certificate_type" => Self::WrongCertificateType,
+            "name_mismatch" => Self::NameMismatch,
+            "suspected_fraud" => Self::SuspectedFraud,
+            "other" => Self::Other(detail.unwrap_or_default()),
+            _ => return None,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Self::Other(t) = self
+            && (t.trim().is_empty() || t.chars().count() > 500)
+        {
+            return Err(DomainError::validation("rejection reason text must be 1-500 characters"));
+        }
+        Ok(())
+    }
+}
+
+/// An uploaded certificate document awaiting (or past) human review
+/// (a row of `certificate_reviews`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CertificationSubmission {
     pub id: Uuid,
@@ -150,6 +199,9 @@ pub struct CertificationSubmission {
     pub status: CertificationStatus,
     pub submitted_at: DateTime<Utc>,
     pub reviewed_at: Option<DateTime<Utc>>,
+    pub reviewer_id: Option<Uuid>,
+    pub rejection_reason: Option<RejectionReason>,
+    pub notes: Option<String>,
 }
 
 impl CertificationSubmission {
@@ -165,15 +217,18 @@ impl CertificationSubmission {
             status: CertificationStatus::Pending,
             submitted_at: now,
             reviewed_at: None,
+            reviewer_id: None,
+            rejection_reason: None,
+            notes: None,
         })
     }
 }
 
 /// Outcome of a human review of a certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertDecision {
     Approve { expires_at: DateTime<Utc> },
-    Reject,
+    Reject { reason: RejectionReason },
 }
 
 #[cfg(test)]
@@ -203,6 +258,34 @@ mod tests {
         assert!(c.can_sell(now + Duration::days(29)));
         assert!(!c.can_sell(now + Duration::days(30)), "expiry instant is exclusive");
         assert_eq!(c.ensure_can_sell(now + Duration::days(31)), Err(RegulatoryViolation::CertificationExpired));
+    }
+
+    #[test]
+    fn can_sell_is_false_at_the_exact_expiry_instant() {
+        let now = Utc::now();
+        let mut c = cook();
+        c.approve_certification(now + Duration::days(30), now).unwrap();
+        let expiry = c.food_safety_cert_expires_at.unwrap();
+        assert!(c.can_sell(expiry - Duration::nanoseconds(1)), "one tick before expiry is still valid");
+        assert!(!c.can_sell(expiry), "now == expires_at must not be sellable");
+        assert_eq!(c.ensure_can_sell(expiry), Err(RegulatoryViolation::CertificationExpired));
+    }
+
+    #[test]
+    fn rejection_reason_parts_round_trip() {
+        for r in [
+            RejectionReason::IllegibleDocument,
+            RejectionReason::ExpiredCertificate,
+            RejectionReason::WrongCertificateType,
+            RejectionReason::NameMismatch,
+            RejectionReason::SuspectedFraud,
+            RejectionReason::Other("stamp looks off".into()),
+        ] {
+            let (k, d) = r.to_parts();
+            assert_eq!(RejectionReason::from_parts(k, d.map(str::to_owned)), Some(r.clone()));
+        }
+        assert!(RejectionReason::Other("  ".into()).validate().is_err());
+        assert!(RejectionReason::from_parts("nope", None).is_none());
     }
 
     #[test]

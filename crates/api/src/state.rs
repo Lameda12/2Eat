@@ -2,12 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use twoeat_domain::PricingPolicy;
+use twoeat_domain::{PricingPolicy, RefundPolicy, WindowedRefundPolicy};
 use twoeat_payments::PaymentGateway;
-use twoeat_persistence::Store;
+use twoeat_persistence::{AuthStore, CookLocationRepo, Store};
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::{
+    auth::limits::RateLimits,
+    email::{Mailer, NoopMailer},
+    error::ApiError,
+};
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
@@ -86,15 +90,72 @@ impl DocumentStore for MemoryDocuments {
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub admin_token: String,
     pub pricing: PricingPolicy,
+    /// Session lifetime (30 days).
+    pub session_ttl: chrono::Duration,
+}
+
+impl AppConfig {
+    pub fn new(pricing: PricingPolicy) -> Self {
+        Self { pricing, session_ttl: chrono::Duration::days(crate::auth::token::SESSION_TTL_DAYS) }
+    }
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    pub auth: Arc<dyn AuthStore>,
+    pub locations: Arc<dyn CookLocationRepo>,
     pub payments: Arc<dyn PaymentGateway>,
     pub documents: Arc<dyn DocumentStore>,
     pub clock: Arc<dyn Clock>,
+    pub mailer: Arc<dyn Mailer>,
+    pub limits: Arc<RateLimits>,
+    pub refund_policy: Arc<dyn RefundPolicy>,
     pub config: AppConfig,
+}
+
+impl AppState {
+    /// One backend implementing all three persistence ports (both `PgStore` and
+    /// `MemoryStore` do). Swap individual parts with the `with_*` methods.
+    pub fn new<S>(
+        backend: Arc<S>,
+        payments: Arc<dyn PaymentGateway>,
+        documents: Arc<dyn DocumentStore>,
+        clock: Arc<dyn Clock>,
+        config: AppConfig,
+    ) -> Self
+    where
+        S: Store + AuthStore + CookLocationRepo + 'static,
+    {
+        Self {
+            store: backend.clone(),
+            auth: backend.clone(),
+            locations: backend,
+            payments,
+            documents,
+            clock,
+            mailer: Arc::new(NoopMailer),
+            limits: Arc::new(RateLimits::default()),
+            refund_policy: Arc::new(WindowedRefundPolicy::default()),
+            config,
+        }
+    }
+
+    pub fn with_locations(mut self, l: Arc<dyn CookLocationRepo>) -> Self {
+        self.locations = l;
+        self
+    }
+    pub fn with_mailer(mut self, m: Arc<dyn Mailer>) -> Self {
+        self.mailer = m;
+        self
+    }
+    pub fn with_limits(mut self, l: RateLimits) -> Self {
+        self.limits = Arc::new(l);
+        self
+    }
+    pub fn with_refund_policy(mut self, p: Arc<dyn RefundPolicy>) -> Self {
+        self.refund_policy = p;
+        self
+    }
 }

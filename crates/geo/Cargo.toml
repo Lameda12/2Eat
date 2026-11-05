@@ -1,0 +1,8 @@
+[package]
+name = "twoeat-geo"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+twoeat-domain.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "twoeat-persistence"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+twoeat-domain.workspace = true
+twoeat-geo.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
